@@ -43,6 +43,41 @@ describe('real game asset resolvers', () => {
     expect(CombatAssetResolver.ball(999)).toBeNull()
   })
 
+  it('rejects out-of-bounds atlas coordinates and falls back to the next looktype', () => {
+    const faulty = {
+      ...catalog.markerAtlas,
+      slots: { ...catalog.markerAtlas.slots, '402': [999, 1] as [number, number] },
+    }
+    const shiny = { id: '1', name: 'Pupitar', level: 1, types: [], locked: false, shiny: true, looktype: 401, lookShiny: 402 }
+    expect(PokemonAssetResolver.atlasSlot(shiny, faulty)).toEqual({ looktype: 401, slot: [12, 2] })
+  })
+
+  it('tries a dedicated shiny sprite when the atlas only has the normal form', () => {
+    const shiny = { id: '1', name: 'Pupitar', level: 1, types: [], locked: false, shiny: true, looktype: 401, lookShiny: 402 }
+    const normalOnly = { ...catalog.markerAtlas, slots: { '401': [12, 2] as [number, number] } }
+    const normalSlot = PokemonAssetResolver.atlasSlot(shiny, normalOnly)
+    expect(normalSlot?.looktype).toBe(401)
+    expect(PokemonAssetResolver.shinyFrameMissingFromAtlas(shiny, normalSlot)).toBe(true)
+    expect(PokemonAssetResolver.shinyFrameMissingFromAtlas(shiny, PokemonAssetResolver.atlasSlot(shiny, catalog.markerAtlas))).toBe(false)
+    expect(PokemonAssetResolver.shinyFrameMissingFromAtlas({ ...shiny, shiny: false }, normalSlot)).toBe(false)
+    expect(PokemonAssetResolver.shinyFrameMissingFromAtlas({ ...shiny, lookShiny: 0 }, normalSlot)).toBe(false)
+  })
+
+  it('never substitutes the normal atlas sprite for a known shiny form', () => {
+    const shiny = { id: '1', name: 'Pupitar', level: 1, types: [], locked: false, shiny: true, looktype: 401, lookShiny: 402 }
+    const normalOnly = { ...catalog.markerAtlas, slots: { '401': [12, 2] as [number, number] } }
+    const normal = PokemonAssetResolver.atlasSlot(shiny, normalOnly)
+    expect(PokemonAssetResolver.mayDisplayAtlasSlot(shiny, normal)).toBe(false)
+    expect(PokemonAssetResolver.frameLooktypes(shiny, normal, false)).toEqual([402])
+    expect(PokemonAssetResolver.frameLooktypes(shiny, normal, true)).toEqual([402])
+    const matchingShiny = PokemonAssetResolver.atlasSlot(shiny, catalog.markerAtlas)
+    expect(PokemonAssetResolver.mayDisplayAtlasSlot(shiny, matchingShiny)).toBe(true)
+    expect(PokemonAssetResolver.frameLooktypes(shiny, matchingShiny, false)).toEqual([])
+    const normalPokemon = { ...shiny, shiny: false }
+    expect(PokemonAssetResolver.mayDisplayAtlasSlot(normalPokemon, normal)).toBe(true)
+    expect(PokemonAssetResolver.frameLooktypes(normalPokemon, normal, true)).toEqual([401])
+  })
+
   it('prefers lookShiny and otherwise resolves the normal looktype', () => {
     const shiny = { id: '1', name: 'Pupitar', level: 1, types: [], locked: false, shiny: true, looktype: 401, lookShiny: 402 }
     expect(PokemonAssetResolver.preferredLooktypes(shiny)).toEqual([402, 401])

@@ -470,10 +470,13 @@ struct CdpProbeError {
 fn cdp_http_client() -> Result<reqwest::Client, BrowserError> {
     reqwest::Client::builder()
         .no_proxy()
+        // A porta CDP pertence ao processo local: nunca siga um 30x enviado
+        // por um servico que ocupou a mesma porta.
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(3))
         .build()
-        .map_err(|error| BrowserError::CdpClient(error.to_string()))
+        .map_err(|_| BrowserError::CdpClient("Não foi possível criar o cliente HTTP de depuração local".into()))
 }
 
 fn request_error(url: String, error: reqwest::Error) -> CdpProbeError {
@@ -486,14 +489,33 @@ fn request_error(url: String, error: reqwest::Error) -> CdpProbeError {
     } else {
         "outro erro HTTP"
     };
-    let nested = std::error::Error::source(&error)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "sem causa interna adicional".into());
+    // Uma falha HTTP pode incluir URL, cabeçalhos e query na cadeia de erros.
+    // Os diagnósticos só recebem a categoria e o endpoint local fixo.
     CdpProbeError {
         kind,
-        source: format!("{error}; source: {nested}"),
+        source: "detalhes internos omitidos por segurança".into(),
         url,
     }
+}
+
+/// O navegador controlado nunca pode entregar um endpoint CDP remoto.
+/// Uma resposta JSON local adulterada nao deve virar uma conexao WebSocket
+/// a um host de terceiros ou a outra porta do computador.
+fn is_local_browser_debugger_url(value: &str, expected_port: u16) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "ws"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(expected_port)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url
+            .path()
+            .strip_prefix("/devtools/browser/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
 async fn fetch_cdp_version(
@@ -517,9 +539,9 @@ async fn fetch_cdp_version(
     let value = response
         .json::<Value>()
         .await
-        .map_err(|error| CdpProbeError {
+        .map_err(|_| CdpProbeError {
             kind: "erro de parsing JSON",
-            source: error.to_string(),
+            source: "resposta do navegador inválida; conteúdo não exibido".into(),
             url: url.clone(),
         })?;
     let browser = value
@@ -540,6 +562,13 @@ async fn fetch_cdp_version(
             source: "campo webSocketDebuggerUrl ausente ou inválido".into(),
             url,
         })?;
+    if !is_local_browser_debugger_url(&web_socket_debugger_url, port) {
+        return Err(CdpProbeError {
+            kind: "endpoint CDP recusado",
+            source: "O navegador retornou um WebSocket de depuracao que nao pertence a porta local esperada".into(),
+            url: format!("http://127.0.0.1:{port}/json/version"),
+        });
+    }
     Ok(CdpVersion {
         browser,
         web_socket_debugger_url,
@@ -604,8 +633,21 @@ fn game_origin(game_url: &str) -> String {
 }
 
 fn is_game_page(target: &CdpTargetInfo, game_origin: &str) -> bool {
-    target.target_type == "page"
-        && (target.url == game_origin || target.url.starts_with(&format!("{game_origin}/")))
+    target.target_type == "page" && url_on_game_origin(&target.url, game_origin)
+}
+
+fn url_on_game_origin(value: &str, expected_origin: &str) -> bool {
+    let (Ok(url), Ok(origin)) = (
+        reqwest::Url::parse(value),
+        reqwest::Url::parse(expected_origin),
+    ) else {
+        return false;
+    };
+    url.scheme() == "https"
+        && url.host_str() == origin.host_str()
+        && url.port() == origin.port()
+        && url.username().is_empty()
+        && url.password().is_none()
 }
 
 async fn cdp_command(
@@ -623,6 +665,13 @@ async fn cdp_command(
     .map_err(|_| BrowserError::Launch(format!("CDP {method}: tempo esgotado")))?
 }
 
+// Erros de resposta do protocolo CDP são controlados pelo processo remoto.
+// Podem conter URLs de debugger, cookies, dados de perfil ou extensões.
+// Nunca exponha o valor original no log ou no painel de diagnóstico.
+fn safe_cdp_error(method: &str, category: &'static str, _raw: impl std::fmt::Display) -> BrowserError {
+    BrowserError::Launch(format!("CDP {method}: {category}"))
+}
+
 async fn cdp_command_inner(
     socket: &mut CdpSocket,
     id: i64,
@@ -638,17 +687,17 @@ async fn cdp_command_inner(
         .stream
         .send(Message::Text(command.to_string().into()))
         .await
-        .map_err(|error| BrowserError::Launch(format!("CDP {method}: {error}")))?;
+        .map_err(|error| safe_cdp_error(method, "falha de envio", error))?;
     while let Some(message) = socket.stream.next().await {
-        let message = message.map_err(|error| BrowserError::Launch(error.to_string()))?;
+        let message = message.map_err(|error| safe_cdp_error(method, "falha de leitura", error))?;
         let Message::Text(raw) = message else {
             continue;
         };
         let response: Value =
-            serde_json::from_str(&raw).map_err(|error| BrowserError::Launch(error.to_string()))?;
+            serde_json::from_str(&raw).map_err(|error| safe_cdp_error(method, "resposta inválida", error))?;
         if response.get("id").and_then(Value::as_i64) == Some(id) {
             if let Some(error) = response.get("error") {
-                return Err(BrowserError::Launch(format!("CDP {method}: {error}")));
+                return Err(safe_cdp_error(method, "comando rejeitado pelo navegador", error));
             }
             return Ok((
                 response.get("result").cloned().unwrap_or(Value::Null),
@@ -1390,7 +1439,7 @@ async fn wait_for_navigated_target(
 }
 
 fn is_pokeidle_socket(url: &str) -> bool {
-    url.contains("://pokeidle.io") || url.contains("://www.pokeidle.io")
+    crate::connection::is_official_game_socket(url)
 }
 
 #[derive(Clone)]
@@ -1657,7 +1706,7 @@ impl ControlledReloadTracker {
                     .and_then(|frame| frame.get("url"))
                     .and_then(Value::as_str)
                     .is_some_and(|url| {
-                        url == game_origin || url.starts_with(&format!("{game_origin}/"))
+                        url_on_game_origin(url, &game_origin)
                     });
                 if is_main_frame && is_game_page {
                     self.document_generation = self.document_generation.saturating_add(1);
@@ -2051,7 +2100,7 @@ fn main_frame_game_navigation_generation(
     let is_game_page = frame
         .and_then(|frame| frame.get("url"))
         .and_then(Value::as_str)
-        .is_some_and(|url| url == game_origin || url.starts_with(&format!("{game_origin}/")));
+        .is_some_and(|url| url_on_game_origin(url, game_origin));
     is_main_frame && is_game_page
 }
 
@@ -2179,7 +2228,7 @@ fn observe_page_event(
     match event.get("method").and_then(Value::as_str) {
         Some("Page.frameNavigated") => {
             let url = event.pointer("/params/frame/url").and_then(Value::as_str);
-            if let Some(url) = url.filter(|url| url.starts_with(game_origin)) {
+            if let Some(url) = url.filter(|url| url_on_game_origin(url, game_origin)) {
                 update(diagnostic, |status| {
                     status.final_url = Some(url.to_owned());
                     status.game_url_navigated = true;
@@ -2911,11 +2960,11 @@ pub async fn start_observer(
     let (stream, _) = match recovery_phase!(connect_async(browser_version.web_socket_debugger_url))
     {
         Ok(connection) => connection,
-        Err(error) => {
+        Err(_) => {
             update(&diagnostic, |status| {
                 status.lifecycle = BrowserLifecycle::Error;
                 status.state = BrowserLifecycle::Error.label().into();
-                status.message = format!("Falha ao conectar ao Browser WebSocket CDP: {error}");
+                status.message = "Falha ao conectar ao WebSocket local do Brave. Detalhes internos omitidos por segurança.".into();
             });
             return;
         }
@@ -5027,5 +5076,56 @@ mod tests {
         );
         println!("Browser: {}", version.browser);
         println!("Browser WS URL obtida: ✓");
+    }
+}
+
+#[cfg(test)]
+mod lorde_browser_origin_tests {
+    use super::{is_pokeidle_socket, url_on_game_origin};
+
+    #[test]
+    fn rejects_forged_browser_page_and_socket_origins() {
+        assert!(url_on_game_origin("https://pokeidle.io/app?x=1", "https://pokeidle.io"));
+        assert!(!url_on_game_origin("https://pokeidle.io.evil.example/app", "https://pokeidle.io"));
+        assert!(!url_on_game_origin("https://pokeidle.io@evil.example/app", "https://pokeidle.io"));
+        assert!(!is_pokeidle_socket("wss://pokeidle.io.attacker.example/socket"));
+        assert!(!is_pokeidle_socket("ws://pokeidle.io/socket"));
+    }
+}
+
+#[cfg(test)]
+mod lorde_debugger_url_security_tests {
+    use super::{is_local_browser_debugger_url, safe_cdp_error};
+
+    #[test]
+    fn cdp_errors_never_expose_browser_response_secrets() {
+        let secret = "{\"message\":\"token=PRIVATE123; cookie=PRIVATE456\"}";
+        let diagnostic = safe_cdp_error("Network.enable", "comando rejeitado pelo navegador", secret)
+            .to_string();
+        assert!(!diagnostic.contains("PRIVATE123"));
+        assert!(!diagnostic.contains("PRIVATE456"));
+        assert!(!diagnostic.contains("cookie="));
+        assert!(diagnostic.contains("Network.enable"));
+    }
+
+    #[test]
+    fn debugger_socket_only_on_exact_local_port() {
+        assert!(is_local_browser_debugger_url(
+            "ws://127.0.0.1:50910/devtools/browser/aabbcc01", 50910,
+        ));
+        for invalid in [
+            "wss://127.0.0.1:50910/devtools/browser/aabbcc01",
+            "ws://localhost:50910/devtools/browser/aabbcc01",
+            "ws://192.168.0.1:50910/devtools/browser/aabbcc01",
+            "ws://127.0.0.1:50911/devtools/browser/aabbcc01",
+            "ws://127.0.0.1:50910@evil.example/devtools/browser/aabbcc01",
+            "ws://evil.example:50910/devtools/browser/aabbcc01",
+            "ws://127.0.0.1:50910/secret",
+            "ws://127.0.0.1:50910/devtools/browser/",
+            "ws://127.0.0.1:50910/devtools/browser/id?x=1",
+            "javascript:alert(1)",
+        ] {
+            assert!(!is_local_browser_debugger_url(invalid, 50910), "{invalid}");
+        }
     }
 }

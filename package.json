@@ -19,12 +19,13 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "tsc -b --pretty false",
-    "check": "npm run lint && npm run typecheck && npm run test",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run test:lorde",
     "tauri": "tauri",
     "tauri:dev:community": "tauri dev -- --no-default-features --features community-build",
     "tauri:dev:smoke": "tauri dev --config src-tauri/tauri.smoke.conf.json --features community-build",
     "tauri:dev:mobile": "tauri dev -- --no-default-features --features community-build,mobile-local-server",
-    "tauri:build:community": "tauri build -- --locked --no-default-features --features community-build"
+    "tauri:build:community": "tauri build -- --locked --no-default-features --features community-build",
+    "test:lorde": "node --experimental-strip-types tests/lorde-fonte-smoke.mjs && node --experimental-strip-types tests/lorde-cache-smoke.mjs && node tests/lorde-cross-platform-paths.mjs && node --experimental-strip-types tests/lorde-frame-validation.mjs && node tests/lorde-rust-backend-smoke.mjs && node tests/lorde-credenciais-fonte.mjs && node tests/lorde-cdp-diagnosticos.mjs && node --test --experimental-strip-types tests/lorde-dominios-funcionais.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.1",

@@ -31,7 +31,7 @@ import guildBoostIcon from './assets/pokeidle-theme/backgrounds/where-hunt-guild
 import twitchBonusIcon from './assets/pokeidle-theme/backgrounds/icon-twitch.png'
 import eventBonusIcon from './assets/ui-icons/event.svg'
 import clockIcon from './assets/ui-icons/clock.svg'
-import sidebarLogo from './assets/pokeidle-theme/backgrounds/sidebar-brand.png'
+import sidebarLogo from './assets/lorde-nexus/wordmark.svg'
 import sidebarWallpaper from './assets/pokeidle-theme/backgrounds/sidebar-wallpaper.png'
 import sharedHeaderScenery from './assets/pokeidle-theme/backgrounds/shared-header-scenery.png'
 import sharedHeaderTitleboard from './assets/pokeidle-theme/backgrounds/shared-header-titleboard.png'
@@ -3726,7 +3726,7 @@ function BootScreen({ status = 'Iniciando…' }: { status?: string }) {
       <span className="boot-brand-mark" aria-hidden="true">
         ◉
       </span>
-      <span className="boot-brand-name">POKEIDLE MANAGER</span>
+      <span className="boot-brand-name">LORDE NEXUS</span>
       <span className="boot-spinner" aria-hidden="true" />
       <span className="boot-status">{status}</span>
     </main>
@@ -3740,7 +3740,7 @@ function PreparingShell() {
       <div className="app-shell startup-shell">
         <aside>
           <div className="brand">
-            <img className="sidebar-brand-art" src={sidebarLogo} alt="Pokeidle Manager" />
+            <img className="sidebar-brand-art" src={sidebarLogo} alt="Lorde Nexus" />
           </div>
           <nav aria-label="Navegação">
             {pages.map((item) => (
@@ -3869,12 +3869,13 @@ function Settings() {
             value={settings.gameUrl}
             onChange={(event) => setSetting('gameUrl', event.target.value)}
           />
+          <span className="muted">Somente o endereço oficial https://pokeidle.io/app é permitido. Sua sessão do Brave é sensível: não instale extensões desconhecidas no perfil do jogo.</span>
         </label>
         <Button onClick={() => alert('A pasta de logs será aberta pela integração desktop.')}>
           Abrir pasta de logs
         </Button>
         <p className="muted">
-          Pokeidle Manager {COMMUNITY.version} · Iniciar com Windows permanece preparado para uma próxima versão.
+          Lorde Nexus · Base Pokeidle Manager {COMMUNITY.version} · Código comunitário GPL-3.0.
         </p>
       </Card>
     </main>
@@ -4411,7 +4412,7 @@ export default function App() {
       <div className="app-shell">
         <aside>
           <div className="brand">
-            <img className="sidebar-brand-art" src={sidebarLogo} alt="Pokeidle Manager" />
+            <img className="sidebar-brand-art" src={sidebarLogo} alt="Lorde Nexus" />
           </div>
           <nav>
             {pages.map((item) => (

@@ -121,6 +121,11 @@ impl PersistedSettings {
     fn normalized(mut self) -> Self {
         self.startup_browser_concurrency =
             normalize_startup_browser_concurrency(self.startup_browser_concurrency);
+        // Evita login em domínios parecidos ou alterados por configurações locais.
+        // Não interfere na autenticação no domínio oficial.
+        if !is_official_pokeidle_url(&self.game_url) {
+            self.game_url = DEFAULT_GAME_URL.into();
+        }
         self
     }
 
@@ -2218,7 +2223,7 @@ pub fn run() {
             let _ = app.manage(readiness.clone());
             startup_mark("tray menu creation start");
             let open =
-                MenuItem::with_id(app, "open", "Abrir Pokeidle Manager", true, None::<&str>)?;
+                MenuItem::with_id(app, "open", "Abrir Lorde Nexus", true, None::<&str>)?;
             let pause = MenuItem::with_id(
                 app,
                 "pause",
@@ -2364,7 +2369,7 @@ pub fn run() {
             save_app_settings
         ])
         .run(tauri::generate_context!())
-        .unwrap_or_else(|error| tracing::error!(%error, "failed to run Pokeidle Manager"));
+        .unwrap_or_else(|error| tracing::error!(%error, "failed to run Lorde Nexus"));
 }
 
 #[cfg(test)]
@@ -2942,5 +2947,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored_enabled, 0);
+    }
+}
+
+// URL de login estritamente oficial: impede URL com userinfo, host parecido,
+// http, porta personalizada e redirecionamento manual para domínio arbitrário.
+fn is_official_pokeidle_url(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else { return false };
+    url.scheme() == "https"
+        && url.host_str() == Some("pokeidle.io")
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (url.path() == "/app" || url.path().starts_with("/app/"))
+}
+
+#[cfg(test)]
+mod lorde_url_security_tests {
+    use super::is_official_pokeidle_url;
+    #[test]
+    fn accepts_only_official_game_origin() {
+        assert!(is_official_pokeidle_url("https://pokeidle.io/app"));
+        assert!(is_official_pokeidle_url("https://pokeidle.io/app?mode=1"));
+        for invalid in [
+            "http://pokeidle.io/app",
+            "https://pokeidle.io.evil.example/app",
+            "https://pokeidle.io@evil.example/app",
+            "https://evil.example/app",
+            "https://pokeidle.io:1443/app",
+            "https://pokeidle.io/application",
+            "file:///C:/login.html",
+        ] {
+            assert!(!is_official_pokeidle_url(invalid), "{invalid}");
+        }
     }
 }

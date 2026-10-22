@@ -854,7 +854,7 @@ describe('Pokeidle Manager UI', () => {
     const accountCard = host.querySelector('.premium-account-card')!
 
     expect(host.querySelector('.shared-page-header-copy .eyebrow')).toBeNull()
-    expect(host.querySelector('.brand .sidebar-brand-art')?.getAttribute('alt')).toBe('Pokeidle Manager')
+    expect(host.querySelector('.brand .sidebar-brand-art')?.getAttribute('alt')).toBe('Lorde Nexus')
     expect(host.querySelectorAll('nav .sidebar-nav-icon img')).toHaveLength(8)
     expect(host.textContent).not.toContain('Sua farm em uma só visão.')
     expect(accountCard.querySelector('.premium-hp-row')?.textContent).toContain('%')

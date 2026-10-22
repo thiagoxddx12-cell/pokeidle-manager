@@ -82,7 +82,9 @@ export function huntCalculationSignature(account: AccountView): string {
 export function hasCompleteCalculationData(account: AccountView) {
   const active = account.activePokemon
   const ivs = active?.ivs
-  return Boolean(active?.speciesId && active.quality && active.potency
+  return Boolean(Number.isSafeInteger(active?.speciesId) && (active?.speciesId ?? 0) > 0
+    && Number.isFinite(active?.quality) && (active?.quality ?? 0) > 0
+    && Number.isSafeInteger(active?.potency) && (active?.potency ?? 0) >= 1 && (active?.potency ?? 0) <= 5
     && ivs && [ivs.hp, ivs.atk, ivs.def, ivs.spAtk, ivs.spDef, ivs.speed].every(Number.isFinite))
 }
 
@@ -158,16 +160,23 @@ function dpsAgainst(
 
 export function bonusMultiplier(account: AccountView, trainer: boolean) {
   const xp = account.xpBonus
+  // Dados live opcionais podem chegar nulos/malformados durante reconexões;
+  // bônus inválidos nunca devem transformar toda a estimativa em NaN/Infinity.
+  const safePercent = (value: number | null | undefined) =>
+    typeof value === 'number' && Number.isFinite(value) ? value : 0
   return (account.vip ? 1.5 : 1)
-    * (1 + (xp?.guildRankPct ?? 0) / 100)
+    * (1 + safePercent(xp?.guildRankPct) / 100)
     * (xp?.guildBoostActive ? 1.1 : 1)
-    * (1 + (xp?.twitchPct ?? 0) / 100)
-    * (1 + ((trainer ? xp?.eventTrainerPct : xp?.eventPokemonPct) ?? 0) / 100)
+    * (1 + safePercent(xp?.twitchPct) / 100)
+    * (1 + safePercent(trainer ? xp?.eventTrainerPct : xp?.eventPokemonPct) / 100)
 }
 
 export function estimateHunts(account: AccountView, reference: HuntReference): HuntEstimate[] {
   const active = account.activePokemon
-  if (!active?.speciesId || !active.ivs || !active.quality || !active.potency) return []
+  // O guia e os snapshots da conta podem estar incompletos durante reconexões.
+  // Não produzir XP/coins NaN a partir de IVs ou níveis sem validação.
+  if (!active?.speciesId || !hasCompleteCalculationData(account)
+    || !Number.isFinite(active.level) || active.level <= 0) return []
   const species = speciesById(reference)
   const activeSpecies = species.get(active.speciesId)
   const stats = activeSpecies && activeStats(account, activeSpecies)
@@ -179,22 +188,32 @@ export function estimateHunts(account: AccountView, reference: HuntReference): H
   const availableHunts = accountCatalogHunts.length ? accountCatalogHunts : reference.hunts
 
   return availableHunts
-    .filter((hunt) => (accountHunts.get(hunt.s)?.level ?? hunt.nv) <= (account.trainerLevel ?? 0))
+    .filter((hunt) => {
+      const observedLevel = accountHunts.get(hunt.s)?.level
+      const level = Number.isSafeInteger(observedLevel) && (observedLevel ?? 0) > 0
+        ? observedLevel! : hunt.nv
+      return level <= (account.trainerLevel ?? 0)
+    })
     .map((hunt) => {
       const observedHunt = accountHunts.get(hunt.s)
       const remoteComposition = observedHunt?.species
         ?.filter((entry): entry is { speciesId: number; weight: number } =>
-          typeof entry.speciesId === 'number' && typeof entry.weight === 'number',
+          typeof entry.speciesId === 'number' && Number.isSafeInteger(entry.speciesId)
+          && entry.speciesId > 0 && typeof entry.weight === 'number'
+          && Number.isFinite(entry.weight) && entry.weight > 0,
         )
         .map((entry) => [entry.speciesId, entry.weight] as [number, number])
       let composition = remoteComposition?.length ? remoteComposition : hunt.e
       if (composition.length && !composition.some(([id]) => species.has(id))) composition = hunt.e
       if (!composition.length) return null
+      const observedLevel = observedHunt?.level
+      const safeLevel = Number.isSafeInteger(observedLevel) && (observedLevel ?? 0) > 0
+        ? observedLevel! : hunt.nv
       const effectiveHunt = {
         ...hunt,
         n: observedHunt?.name ?? hunt.n,
         a: observedHunt?.region ?? observedHunt?.area ?? hunt.a,
-        nv: observedHunt?.level ?? hunt.nv,
+        nv: safeLevel,
       }
       const spawnList = composition
         .map(([id, weight]) => ({ species: species.get(id), weight: Math.max(0, weight) }))
@@ -243,23 +262,27 @@ export function readHuntReference(value: unknown): HuntReference | null {
   const species = candidate.especies.filter((item): item is ReferenceSpecies => {
     if (!item || typeof item !== 'object') return false
     const record = item as ReferenceSpecies
-    return Number.isFinite(record.id) && typeof record.n === 'string'
+    return Number.isSafeInteger(record.id) && record.id > 0 && typeof record.n === 'string'
       && Array.isArray(record.t) && record.t.every((type) => typeof type === 'string')
       && Array.isArray(record.b) && record.b.length >= 6
-      && record.b.slice(0, 6).every(Number.isFinite) && Array.isArray(record.m)
+      && record.b.slice(0, 6).every((stat) => Number.isFinite(stat) && stat >= 0)
+      && Array.isArray(record.m)
       && record.m.every((move) => Array.isArray(move) && move.length >= 6
         && typeof move[0] === 'string' && typeof move[1] === 'string'
-        && [move[2], move[3], move[4], move[5]].every(Number.isFinite))
-      && (record.l === undefined || record.l.every((loot) => Array.isArray(loot)
-        && typeof loot[0] === 'string' && [loot[1], loot[2], loot[3], loot[4]].every(Number.isFinite)))
+        && [move[2], move[3], move[4], move[5]].every((value) => Number.isFinite(value) && value >= 0))
+      && (record.l === undefined || (Array.isArray(record.l)
+        && record.l.every((loot) => Array.isArray(loot)
+        && typeof loot[0] === 'string' && [loot[1], loot[2], loot[3], loot[4]]
+          .every((value) => Number.isFinite(value) && value >= 0))))
   })
   const hunts = candidate.hunts.filter((item): item is ReferenceHunt => {
     if (!item || typeof item !== 'object') return false
     const record = item as ReferenceHunt
     return typeof record.s === 'string' && typeof record.n === 'string'
-      && typeof record.a === 'string' && Number.isFinite(record.nv)
+      && typeof record.a === 'string' && Number.isSafeInteger(record.nv) && record.nv > 0
       && Array.isArray(record.e) && record.e.every((spawn) => Array.isArray(spawn)
-        && spawn.length >= 2 && Number.isFinite(spawn[0]) && Number.isFinite(spawn[1]))
+        && spawn.length >= 2 && Number.isSafeInteger(spawn[0]) && spawn[0] > 0
+        && Number.isFinite(spawn[1]) && spawn[1] >= 0)
   })
   const looktypes = candidate.looktypes && typeof candidate.looktypes === 'object'
     ? Object.fromEntries(Object.entries(candidate.looktypes)

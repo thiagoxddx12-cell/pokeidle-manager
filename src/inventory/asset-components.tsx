@@ -2,12 +2,14 @@ import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { useEffect, useState } from 'react'
 import type { DepotPokemon, InventoryItem } from '../types'
 import { ItemAssetResolver, PokemonAssetResolver, type GameItemCatalog } from './assets'
-import { createPokemonSpriteResolver, type PokemonSpriteFrame } from './sprite-cache'
+import { createPokemonSpriteResolver, isValidPokemonSpriteFrame, type PokemonSpriteFrame } from './sprite-cache'
+import { createAssetRequestCache } from './asset-request-cache'
 
 type ResolvedAsset = { path: string }
 type SpriteFrame = PokemonSpriteFrame
 
-const assetRequests = new Map<string, Promise<string | null>>()
+// Reusable results for sprites/items. A temporary failure never remains cached forever.
+const ASSET_RETRY_DELAY_MS = 35_000
 const resolvePokemonSprite = createPokemonSpriteResolver((looktype) =>
   invoke<SpriteFrame | null>('resolve_pokemon_sprite', { looktypes: [looktype] }),
 )
@@ -25,37 +27,47 @@ function verifyImageUrl(url: string): Promise<string> {
   })
 }
 
-function useAssetUrl(assetPath: string | null | undefined) {
-  const [url, setUrl] = useState<string | null>(null)
+const assetRequestCache = createAssetRequestCache(async (assetPath: string) => {
+  const asset = await invoke<ResolvedAsset>('resolve_game_asset', { assetPath })
+  return verifyImageUrl(convertFileSrc(asset.path))
+})
+
+type AssetLoadStatus = 'loading' | 'ready' | 'error'
+type AssetLoad = { assetPath: string | null; url: string | null; status: AssetLoadStatus }
+
+function useAssetState(assetPath: string | null | undefined): AssetLoad {
+  const currentPath = assetPath || null
+  const [state, setState] = useState<AssetLoad>({ assetPath: null, url: null, status: 'error' })
   useEffect(() => {
     let active = true
+    let retry: ReturnType<typeof setTimeout> | undefined
     if (!assetPath || !inTauri()) {
-      setUrl(null)
-      return () => {
-        active = false
-      }
+      setState({ assetPath: currentPath, url: null, status: 'error' })
+      return () => { active = false }
     }
-    let request = assetRequests.get(assetPath)
-    if (!request) {
-      request = invoke<ResolvedAsset>('resolve_game_asset', { assetPath })
-        .then((asset) => verifyImageUrl(convertFileSrc(asset.path)))
-        .catch(() => {
-          // A resposta negativa do Rust tem TTL. Não retenha uma falha de
-          // transporte no cliente para sempre: uma próxima montagem pode tentar
-          // de novo depois de o recurso voltar a ficar disponível.
-          assetRequests.delete(assetPath)
-          return null
-        })
-      assetRequests.set(assetPath, request)
+    setState({ assetPath: currentPath, url: null, status: 'loading' })
+    async function load() {
+      const url = await assetRequestCache.request(assetPath!)
+      if (!active) return
+      setState({ assetPath: currentPath, url, status: url ? 'ready' : 'error' })
+      // A rede do jogo pode ter falhado. Revalidar sem recriar a tela,
+      // com um único timer por item visível e limpeza na desmontagem.
+      if (!url) retry = setTimeout(() => { void load() }, ASSET_RETRY_DELAY_MS)
     }
-    void request.then((value) => {
-      if (active) setUrl(value)
-    })
+    void load()
     return () => {
       active = false
+      if (retry !== undefined) clearTimeout(retry)
     }
-  }, [assetPath])
-  return url
+  }, [assetPath, currentPath])
+  // A grade virtual não pode reutilizar imagem da linha anterior.
+  return state.assetPath === currentPath
+    ? state
+    : { assetPath: currentPath, url: null, status: currentPath ? 'loading' : 'error' }
+}
+
+function useAssetUrl(assetPath: string | null | undefined) {
+  return useAssetState(assetPath).url
 }
 
 function AssetFallback({ label, className = '' }: { label: string; className?: string }) {
@@ -79,6 +91,11 @@ export function ItemAsset({
   const url = useAssetUrl(source)
   const [failed, setFailed] = useState(false)
   useEffect(() => setFailed(false), [url])
+  useEffect(() => {
+    if (!failed) return
+    const retry = setTimeout(() => setFailed(false), ASSET_RETRY_DELAY_MS)
+    return () => clearTimeout(retry)
+  }, [failed, url])
   if (!url || failed)
     return <AssetFallback label={item.name} className={compact ? 'asset-compact' : ''} />
   return (
@@ -86,33 +103,43 @@ export function ItemAsset({
       className={`resolved-asset ${compact ? 'asset-compact' : ''}`.trim()}
       src={url}
       alt=""
-      onError={() => setFailed(true)}
+      onError={() => { if (source) assetRequestCache.invalidate(source); setFailed(true) }}
     />
   )
 }
 
+// Resolucoes de sprites que falham devem ser repetidas sem reiniciar o Manager.
+// O backend e o cache TS revalidam ausencias apos 30s; agendamos um pouco
+// depois, apenas enquanto a linha do inventario estiver montada/visivel.
+const SPRITE_RETRY_DELAY_MS = 31_000
 function useSpriteFrame(key: string) {
-  const [frame, setFrame] = useState<SpriteFrame | null>(null)
+  const [resolved, setResolved] = useState<{ key: string; frame: SpriteFrame | null }>({ key: '', frame: null })
   useEffect(() => {
     let active = true
+    let retry: ReturnType<typeof setTimeout> | undefined
+    setResolved({ key, frame: null })
     if (!key || !inTauri()) {
-      setFrame(null)
-      return () => {
-        active = false
-      }
+      return () => { active = false }
     }
-    void resolvePokemonSprite(key.split(',').map(Number).filter(Number.isFinite))
-      .then((value) => {
-        if (active) setFrame(value)
-      })
-      .catch(() => {
-        if (active) setFrame(null)
-      })
+    const looktypes = key.split(',').map(Number).filter(Number.isFinite)
+    async function load() {
+      let frame: SpriteFrame | null = null
+      try {
+        frame = await resolvePokemonSprite(looktypes)
+      } catch {
+        // Falhas temporarias nao devem causar retry rapido ou tela travada.
+      }
+      if (!active) return
+      setResolved({ key, frame })
+      if (!frame) retry = setTimeout(() => { void load() }, SPRITE_RETRY_DELAY_MS)
+    }
+    void load()
     return () => {
       active = false
+      if (retry !== undefined) clearTimeout(retry)
     }
   }, [key])
-  return frame
+  return resolved.key === key ? resolved.frame : null
 }
 
 export function PokemonAsset({
@@ -125,12 +152,33 @@ export function PokemonAsset({
   size?: number
 }) {
   const visualSize = Math.max(32, size)
-  const preferred = PokemonAssetResolver.preferredLooktypes(pokemon)
   const atlas = PokemonAssetResolver.atlasSlot(pokemon, catalog.markerAtlas)
-  const atlasUrl = useAssetUrl(atlas ? catalog.markerAtlas.assetPath : null)
-  const frame = useSpriteFrame(atlas ? '' : preferred.join(','))
+  const atlasAsset = useAssetState(atlas ? catalog.markerAtlas.assetPath : null)
+  // O atlas pode conter a forma normal mas não a forma shiny. Nesse caso,
+  // tentamos a imagem shiny separada antes de recorrer ao atlas comum.
+  const needShinyFrame = PokemonAssetResolver.shinyFrameMissingFromAtlas(pokemon, atlas)
+  const frameCandidates = PokemonAssetResolver.frameLooktypes(
+    pokemon, atlas, !atlas || atlasAsset.status === 'error',
+  )
+  const frame = useSpriteFrame(frameCandidates.join(','))
   const frameUrl = useAssetUrl(frame?.assetPath)
-  if (atlas && atlasUrl) {
+  const scaledFrame = isValidPokemonSpriteFrame(frame) && frameUrl
+    ? (() => {
+        const scale = Math.min((visualSize - 6) / frame.width, (visualSize - 6) / frame.height)
+        return (
+          <span className="pokemon-asset-frame" role="img" aria-label={pokemon.name}
+            style={{ width: visualSize, height: visualSize }}>
+            <span style={{
+              width: frame.width * scale, height: frame.height * scale,
+              backgroundImage: `url("${frameUrl}")`,
+              backgroundSize: `${frame.pageWidth * scale}px ${frame.pageHeight * scale}px`,
+              backgroundPosition: `-${frame.x * scale}px -${frame.y * scale}px`,
+            }} />
+          </span>
+        )
+      })() : null
+  if (needShinyFrame && scaledFrame) return scaledFrame
+  if (atlas && atlasAsset.url && PokemonAssetResolver.mayDisplayAtlasSlot(pokemon, atlas)) {
     const [column, row] = atlas.slot
     return (
       <span
@@ -140,33 +188,13 @@ export function PokemonAsset({
         style={{
           width: visualSize,
           height: visualSize,
-          backgroundImage: `url("${atlasUrl}")`,
+          backgroundImage: `url("${atlasAsset.url}")`,
           backgroundSize: `${catalog.markerAtlas.cols * 100}% ${catalog.markerAtlas.rows * 100}%`,
           backgroundPosition: `${(column / Math.max(1, catalog.markerAtlas.cols - 1)) * 100}% ${(row / Math.max(1, catalog.markerAtlas.rows - 1)) * 100}%`,
         }}
       />
     )
   }
-  if (frame && frameUrl) {
-    const scale = Math.min((visualSize - 6) / frame.width, (visualSize - 6) / frame.height)
-    return (
-      <span
-        className="pokemon-asset-frame"
-        role="img"
-        aria-label={pokemon.name}
-        style={{ width: visualSize, height: visualSize }}
-      >
-        <span
-          style={{
-            width: frame.width * scale,
-            height: frame.height * scale,
-            backgroundImage: `url("${frameUrl}")`,
-            backgroundSize: `${frame.pageWidth * scale}px ${frame.pageHeight * scale}px`,
-            backgroundPosition: `-${frame.x * scale}px -${frame.y * scale}px`,
-          }}
-        />
-      </span>
-    )
-  }
-  return <AssetFallback label={pokemon.name} className="pokemon-asset-fallback" />
+  if (scaledFrame) return scaledFrame
+  return <AssetFallback label={needShinyFrame ? `${pokemon.name} shiny` : pokemon.name} className="pokemon-asset-fallback" />
 }

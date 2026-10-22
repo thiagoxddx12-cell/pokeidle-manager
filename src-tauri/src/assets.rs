@@ -13,7 +13,9 @@ use tokio::sync::{OnceCell, Semaphore};
 const GAME_ORIGIN: &str = "https://pokeidle.io";
 const HUNT_GUIDE_ORIGIN: &str = "https://guiapokeidlehardtocapture.site";
 const CACHE_VERSION: &str = "catalog-v1.json";
-const NEGATIVE_CACHE_FOR: Duration = Duration::from_secs(5 * 60);
+// Falhas de imagem são temporárias; limitar a janela de cache negativa.
+const NEGATIVE_CACHE_FOR: Duration = Duration::from_secs(75);
+const SPRITE_NEGATIVE_CACHE_FOR: Duration = Duration::from_secs(30);
 const MAX_ASSET_BYTES: usize = 5 * 1024 * 1024;
 const MAX_HUNT_REFERENCE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -84,7 +86,8 @@ pub struct GameAssetService {
     inflight: Arc<Mutex<HashMap<String, Arc<OnceCell<Result<ResolvedAsset, String>>>>>>,
     negative: Arc<Mutex<HashMap<String, Instant>>>,
     catalog: Arc<Mutex<Option<Arc<CatalogSource>>>>,
-    sprites: Arc<Mutex<HashMap<u64, Option<PokemonSprite>>>>,
+    // Salva junto o instante de consulta para revalidar ausencias temporarias.
+    sprites: Arc<Mutex<HashMap<u64, (Option<PokemonSprite>, Instant)>>>,
     hunt_reference: Arc<OnceCell<Arc<serde_json::Value>>>,
     hunt_species_looktypes: Arc<OnceCell<Arc<BTreeMap<u64, u64>>>>,
 }
@@ -178,6 +181,17 @@ impl GameAssetService {
         fs::create_dir_all(root.join("files")).map_err(|error| error.to_string())?;
         let client = reqwest::Client::builder()
             .no_proxy()
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 3
+                    || attempt.url().scheme() != "https"
+                    || attempt.url().host_str() != Some("pokeidle.io")
+                    || attempt.url().port().is_some()
+                {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .connect_timeout(Duration::from_secs(4))
             .timeout(Duration::from_secs(12))
             .build()
@@ -188,7 +202,9 @@ impl GameAssetService {
             .timeout(Duration::from_secs(20))
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 if attempt.previous().len() >= 3
+                    || attempt.url().scheme() != "https"
                     || attempt.url().host_str() != Some("guiapokeidlehardtocapture.site")
+                    || attempt.url().port().is_some()
                 {
                     attempt.stop()
                 } else {
@@ -356,14 +372,18 @@ impl GameAssetService {
     ) -> Result<Option<PokemonSprite>, String> {
         let catalog = self.catalog().await?;
         for looktype in looktypes {
-            if let Some(cached) = self.sprites.lock().get(&looktype).cloned() {
+            if let Some((cached, checked_at)) = self.sprites.lock().get(&looktype).cloned() {
                 if cached.is_some() {
                     return Ok(cached);
                 }
-                continue;
+                // Nunca guarde uma ausencia para sempre: pode ser falha ou
+                // atualizacao posterior da especie/manifesto no jogo.
+                if checked_at.elapsed() < SPRITE_NEGATIVE_CACHE_FOR {
+                    continue;
+                }
             }
             let sprite = self.load_sprite(&catalog, looktype).await?;
-            self.sprites.lock().insert(looktype, sprite.clone());
+            self.sprites.lock().insert(looktype, (sprite.clone(), Instant::now()));
             if sprite.is_some() {
                 return Ok(sprite);
             }
@@ -514,9 +534,13 @@ impl GameAssetService {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32
         };
+        let x = number("x");
+        let y = number("y");
         let width = number("w");
         let height = number("h");
-        if width == 0 || height == 0 || page_width == 0 || page_height == 0 {
+        // Um manifesto externo pode informar um frame fora da pagina.
+        // Nao armazene no cache um recorte que a interface teria de rejeitar.
+        if !valid_sprite_geometry(x, y, width, height, page_width, page_height) {
             return Ok(None);
         }
         let asset_path = format!(
@@ -527,8 +551,8 @@ impl GameAssetService {
         );
         Ok(Some(PokemonSprite {
             asset_path,
-            x: number("x"),
-            y: number("y"),
+            x,
+            y,
             width,
             height,
             page_width,
@@ -590,6 +614,24 @@ fn normalize_item_icon(icon: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Checks sprite geometry before it enters the backend cache.
+/// checked_add also protects against overflowing untrusted manifest values.
+fn valid_sprite_geometry(
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    page_width: u32,
+    page_height: u32,
+) -> bool {
+    width > 0
+        && height > 0
+        && page_width > 0
+        && page_height > 0
+        && x.checked_add(width).is_some_and(|end| end <= page_width)
+        && y.checked_add(height).is_some_and(|end| end <= page_height)
 }
 
 fn validate_asset_path(path: &str) -> Result<String, String> {
@@ -785,6 +827,20 @@ mod tests {
         assert_eq!(looktypes.get(&292), Some(&60292));
         assert!(!looktypes.contains_key(&339));
         assert!(!looktypes.contains_key(&25));
+    }
+
+    #[test]
+    fn lorde_rejects_sprite_frames_outside_pages_and_integer_overflow() {
+        assert!(valid_sprite_geometry(0, 0, 64, 64, 64, 64));
+        assert!(valid_sprite_geometry(64, 70, 32, 16, 256, 256));
+        assert!(!valid_sprite_geometry(50, 0, 30, 32, 64, 64));
+        assert!(!valid_sprite_geometry(0, 60, 32, 32, 64, 64));
+        assert!(!valid_sprite_geometry(0, 0, 0, 1, 64, 64));
+        assert!(!valid_sprite_geometry(0, 0, 32, 0, 64, 64));
+        assert!(!valid_sprite_geometry(0, 0, 32, 32, 0, 64));
+        assert!(!valid_sprite_geometry(0, 0, 32, 32, 64, 0));
+        assert!(!valid_sprite_geometry(u32::MAX, 0, 2, 2, u32::MAX, 64));
+        assert!(!valid_sprite_geometry(0, u32::MAX, 2, 2, 64, u32::MAX));
     }
 
     #[test]

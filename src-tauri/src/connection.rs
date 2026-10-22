@@ -24,6 +24,19 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 const HEARTBEAT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMAND_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Only the first-party TLS websocket is allowed to receive a captured session.
+/// Never use `contains("://pokeidle.io")`: lookalike domains can bypass that.
+pub(crate) fn is_official_game_socket(value: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return false;
+    };
+    url.scheme() == "wss"
+        && matches!(url.host_str(), Some("pokeidle.io" | "www.pokeidle.io"))
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 #[derive(Clone)]
 pub struct SessionHeaders(Vec<(String, String)>);
 impl SessionHeaders {
@@ -112,6 +125,31 @@ pub enum ConnectionError {
     CommandQueue(String),
 }
 
+/// WebSocket errors may include a URL, query token or request headers.
+/// Expose only safe categories, never the raw dependency error description.
+fn safe_socket_connect_error(error: WebSocketError) -> ConnectionError {
+    match error {
+        WebSocketError::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            ConnectionError::AuthenticationRejected(response.status().as_u16())
+        }
+        WebSocketError::Http(response) => ConnectionError::Connect(format!(
+            "O servidor do jogo recusou a conexão (HTTP {}).",
+            response.status().as_u16()
+        )),
+        _ => ConnectionError::Connect(
+            "Falha de rede, TLS ou WebSocket. Detalhes sensíveis foram omitidos.".into(),
+        ),
+    }
+}
+
+fn safe_socket_send_error<E>(_: E) -> ConnectionError {
+    ConnectionError::SendHello("falha ao enviar a mensagem inicial".into())
+}
+
+fn safe_socket_receive_error<E>(_: E) -> ConnectionError {
+    ConnectionError::Receive("falha ao receber uma mensagem do servidor".into())
+}
+
 pub struct BackgroundConnection {
     cancellation: CancellationToken,
     receiver: JoinHandle<()>,
@@ -186,23 +224,29 @@ impl ConnectionManager {
         ),
         ConnectionError,
     > {
+        if !is_official_game_socket(&bootstrap.ws_url) {
+            return Err(ConnectionError::Request(
+                "Destino WebSocket fora do domínio oficial do jogo; sessão não enviada.".into(),
+            ));
+        }
         let mut request = bootstrap
             .ws_url
             .clone()
             .into_client_request()
-            .map_err(|error| ConnectionError::Request(error.to_string()))?;
+            // The captured URL may contain session query parameters.
+            // Never return it (or dependency error strings) to UI/diagnostics.
+            .map_err(|_| ConnectionError::Request(
+                "Não foi possível preparar a conexão segura do jogo.".into(),
+            ))?;
         bootstrap.headers.apply(&mut request);
-        let (mut socket, _) = connect_async(request).await.map_err(|error| match error {
-            WebSocketError::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
-                ConnectionError::AuthenticationRejected(response.status().as_u16())
-            }
-            error => ConnectionError::Connect(error.to_string()),
-        })?;
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(safe_socket_connect_error)?;
         let hello = bootstrap.hello.to_wire();
         socket
             .send(Message::Text(hello.clone().into()))
             .await
-            .map_err(|error| ConnectionError::SendHello(error.to_string()))?;
+            .map_err(safe_socket_send_error)?;
         accounts.record_protocol_frame(
             &bootstrap.account_id,
             ProtocolDirection::ClientToServer,
@@ -211,8 +255,7 @@ impl ConnectionManager {
         );
         let welcome = tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(message) = socket.next().await {
-                let message =
-                    message.map_err(|error| ConnectionError::Receive(error.to_string()))?;
+                let message = message.map_err(safe_socket_receive_error)?;
                 if let Message::Text(payload) = message {
                     accounts.record_protocol_frame(
                         &bootstrap.account_id,
@@ -221,7 +264,7 @@ impl ConnectionManager {
                         &payload,
                     );
                     let frame = ServerFrame::parse(&payload)
-                        .map_err(|error| ConnectionError::Receive(error.to_string()))?;
+                        .map_err(safe_socket_receive_error)?;
                     if matches!(frame, ServerFrame::Welcome(_)) {
                         return Ok(frame);
                     }
@@ -502,5 +545,41 @@ mod tests {
             ConnectionManager::reconnect_delay(9),
             Duration::from_secs(60)
         );
+    }
+}
+
+#[cfg(test)]
+mod lorde_session_domain_tests {
+    use super::{is_official_game_socket, safe_socket_connect_error};
+    use tokio_tungstenite::tungstenite::Error as WebSocketError;
+
+    #[test]
+    fn connection_failure_does_not_expose_session_query_or_cookies() {
+        let error = WebSocketError::Io(std::io::Error::other(
+            "wss://pokeidle.io/socket?token=TOP_SECRET; cookie=MY_COOKIE",
+        ));
+        let diagnostic = safe_socket_connect_error(error).to_string();
+        assert!(!diagnostic.contains("TOP_SECRET"));
+        assert!(!diagnostic.contains("MY_COOKIE"));
+        assert!(!diagnostic.contains("?token="));
+    }
+
+    #[test]
+    fn accepts_only_official_tls_game_socket() {
+        for allowed in ["wss://pokeidle.io/socket", "wss://www.pokeidle.io/ws?sid=abc"] {
+            assert!(is_official_game_socket(allowed), "{allowed}");
+        }
+        for blocked in [
+            "ws://pokeidle.io/socket",
+            "wss://pokeidle.io.attacker.example/socket",
+            "wss://pokeidle.io@evil.example/socket",
+            "wss://pokeidle.io:9443/socket",
+            "wss://evil.example/://pokeidle.io/socket",
+            "wss://example.test/socket?redirect=://pokeidle.io",
+            "https://pokeidle.io/socket",
+            "file:///C:/profile",
+        ] {
+            assert!(!is_official_game_socket(blocked), "{blocked}");
+        }
     }
 }

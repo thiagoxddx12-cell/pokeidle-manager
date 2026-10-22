@@ -10,28 +10,39 @@ pub fn sanitize_frame(raw: &str) -> String {
         Ok(value) => value,
         Err(_) => return "[non-json frame]".into(),
     };
+    // A login hello is always secret-bearing, including fields unknown to us.
+    // A strict projection protects against future protocol field additions.
+    if value.get("t").and_then(serde_json::Value::as_str) == Some("hello") {
+        return r#"{"t":"hello","credenciais":"[REDACTED]"}"#.into();
+    }
     redact(&mut value);
     value.to_string()
 }
+
+fn secret_field(key: &str) -> bool {
+    let key = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("cookie")
+        || key.contains("apikey")
+        || key.contains("credential")
+        || key == "authorization"
+        || key == "auth"
+        || key == "jwt"
+        || key == "dispositivo"
+        || key == "deviceid"
+}
+
 fn redact(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             for (key, value) in map.iter_mut() {
-                if [
-                    "token",
-                    "access_token",
-                    "refresh_token",
-                    "cookie",
-                    "cookies",
-                    "set-cookie",
-                    "authorization",
-                    "dispositivo",
-                    "deviceid",
-                    "device_id",
-                ]
-                .iter()
-                .any(|s| key.eq_ignore_ascii_case(s))
-                {
+                if secret_field(key) {
                     *value = serde_json::Value::String("[REDACTED]".into());
                 } else {
                     redact(value);
@@ -49,6 +60,21 @@ fn redact(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redacts_camel_case_nested_and_unknown_hello_keys() {
+        let raw = r#"{"t":"state","nested":{"sessionToken":"SESSION123","apiKey":"KEY123","refresh-token":"R123","stats":42}}"#;
+        let safe = sanitize_frame(raw);
+        for secret in ["SESSION123", "KEY123", "R123"] {
+            assert!(!safe.contains(secret));
+        }
+        assert!(safe.contains("42"));
+        let future_hello = r#"{"t":"hello","pass": "FUTURE_PASS", "newFieldSecret": "FUTURE_SECRET"}"#;
+        let safe = sanitize_frame(future_hello);
+        assert!(!safe.contains("FUTURE_PASS"));
+        assert!(!safe.contains("FUTURE_SECRET"));
+        assert!(safe.contains("REDACTED"));
+    }
+
     #[test]
     fn redacts_secrets() {
         assert!(

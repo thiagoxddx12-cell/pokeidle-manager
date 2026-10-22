@@ -23,12 +23,36 @@ export const emptyCatalog: GameItemCatalog = {
 }
 
 let catalogRequest: Promise<GameItemCatalog> | null = null
+function fetchGameItemCatalog() {
+  if (!catalogRequest) {
+    catalogRequest = invoke<GameItemCatalog>('game_item_catalog').catch((error: unknown) => {
+      // Nunca memorize permanentemente uma promessa rejeitada: isso deixava
+      // todos os sprites e nomes de itens ausentes ate reiniciar o aplicativo.
+      catalogRequest = null
+      throw error
+    })
+  }
+  return catalogRequest
+}
 export function useGameItemCatalog() {
   const [catalog, setCatalog] = useState<GameItemCatalog>(emptyCatalog)
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return
-    catalogRequest ??= invoke<GameItemCatalog>('game_item_catalog')
-    void catalogRequest.then(setCatalog).catch(() => setCatalog(emptyCatalog))
+    let active = true
+    let timer: ReturnType<typeof setTimeout> | undefined
+    async function refresh() {
+      try {
+        const result = await fetchGameItemCatalog()
+        if (active) setCatalog(result)
+      } catch {
+        if (active) timer = setTimeout(() => { void refresh() }, 30_000)
+      }
+    }
+    void refresh()
+    return () => {
+      active = false
+      if (timer !== undefined) clearTimeout(timer)
+    }
   }, [])
   return catalog
 }
@@ -67,10 +91,34 @@ export const PokemonAssetResolver = {
     const values = pokemon.shiny ? [pokemon.lookShiny, pokemon.looktype] : [pokemon.looktype]
     return [...new Set(values.filter((value): value is number => typeof value === 'number' && Number.isInteger(value) && value > 0))]
   },
+  // Se o atlas inclui apenas a forma normal, tente buscar o sprite shiny
+  // individual primeiro; jamais apresente a forma normal como se fosse shiny
+  // quando a imagem correta puder ser encontrada.
+  shinyFrameMissingFromAtlas(pokemon: DepotPokemon, chosen: { looktype: number } | null) {
+    const shiny = pokemon.lookShiny
+    return Boolean(pokemon.shiny && typeof shiny === 'number' && Number.isSafeInteger(shiny)
+      && shiny > 0 && shiny !== pokemon.looktype && chosen?.looktype !== shiny)
+  },
+  // Nunca exiba a forma comum de um shiny cujo lookShiny é conhecido.
+  // Se a imagem especial não existir, mantenha o fallback visual e tente
+  // novamente mais tarde em vez de identificar erroneamente o Pokémon.
+  mayDisplayAtlasSlot(pokemon: DepotPokemon, chosen: { looktype: number } | null) {
+    return Boolean(chosen && !this.shinyFrameMissingFromAtlas(pokemon, chosen))
+  },
+  frameLooktypes(pokemon: DepotPokemon, chosen: { looktype: number } | null, atlasUnavailable: boolean) {
+    const preferred = this.preferredLooktypes(pokemon)
+    const explicitShiny = this.shinyFrameMissingFromAtlas(pokemon, null)
+    if (atlasUnavailable) return explicitShiny ? preferred.slice(0, 1) : preferred
+    return this.shinyFrameMissingFromAtlas(pokemon, chosen) ? preferred.slice(0, 1) : []
+  },
   atlasSlot(pokemon: DepotPokemon, atlas: MarkerAtlas) {
     for (const looktype of this.preferredLooktypes(pokemon)) {
       const slot = atlas.slots[String(looktype)]
-      if (slot) return { looktype, slot }
+      if (
+        slot && slot.length === 2 &&
+        slot.every((value) => Number.isSafeInteger(value) && value >= 0) &&
+        slot[0] < atlas.cols && slot[1] < atlas.rows
+      ) return { looktype, slot }
     }
     return null
   },
